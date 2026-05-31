@@ -1,0 +1,37 @@
+##### File tells git what to never track ########
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# dbt
+target/
+dbt_packages/
+logs/
+
+# Dagster
+.dagster/
+
+# Great Expectations
+great_expectations/uncommitted/
+
+# Data files
+*.csv
+*.parquet
+data/raw/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+*.pem
+secrets/.env
