@@ -83,6 +83,12 @@ CREATE TYPE incident_intensity AS ENUM (
     'high'
 );
 
+CREATE TYPE intervention_category AS ENUM (
+    'antecedent',
+    'replacement',
+    'consequence'
+);
+
 
 -- ----------------------------------------------------------------------------
 -- SECTION 2: LOOKUP TABLES
@@ -115,7 +121,11 @@ CREATE TABLE skill_areas (
 
 CREATE TABLE intervention_types (
     name            VARCHAR(50) PRIMARY KEY,
-    category        VARCHAR(30),
+    -- category uses an ENUM because the ABC taxonomy (antecedent /
+    -- replacement / consequence) is foundational behavior analysis and
+    -- won't churn. Specific intervention names CAN evolve, which is why
+    -- the table itself stays as a lookup rather than an ENUM.
+    category        intervention_category,
     description     TEXT
 );
 
@@ -131,6 +141,19 @@ CREATE TABLE payers (
     state           CHAR(2),
     auth_period_weeks INTEGER NOT NULL DEFAULT 26,
     notes           TEXT
+);
+
+-- NEW IN V3: Intake document vocabulary. Kept as a table (not ENUM)
+-- because document types evolve over time — a practice may add
+-- release-of-information forms, school IEPs, or prior provider records
+-- as the system matures. required_for_intake flags the documents that
+-- gate a client becoming active; has_expiration flags consents that need
+-- to be re-signed periodically (typically annual).
+CREATE TABLE document_types (
+    name            VARCHAR(50) PRIMARY KEY,
+    description     TEXT,
+    required_for_intake BOOLEAN NOT NULL DEFAULT FALSE,
+    has_expiration  BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 
@@ -176,6 +199,26 @@ CREATE TABLE service_locations (
     active          BOOLEAN NOT NULL DEFAULT TRUE
 );
 
+-- NEW IN V3: Documents collected during intake and ongoing care — medical
+-- consent to treat, the diagnostic report, the ABA referral, and any other
+-- supporting documentation a payer might request during an audit. The
+-- expiration field exists because some consents (notably HIPAA
+-- authorizations) expire annually and need re-signing; tracking the
+-- expiration date in the database means "what's expiring in 30 days" is
+-- a query, not a calendar reminder Alexandre has to maintain in his head.
+CREATE TABLE client_documents (
+    id              SERIAL PRIMARY KEY,
+    client_id       INTEGER NOT NULL REFERENCES clients(id),
+    document_type   VARCHAR(50) NOT NULL REFERENCES document_types(name),
+    received_date   DATE NOT NULL,
+    expiration_date DATE,
+    file_path       TEXT,
+    uploaded_by_id  INTEGER REFERENCES staff(id),
+    uploaded_at     TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    notes           TEXT,
+    CHECK (expiration_date IS NULL OR expiration_date > received_date)
+);
+
 
 -- ----------------------------------------------------------------------------
 -- SECTION 4: AUTHORIZATIONS & TREATMENT PLANS
@@ -191,9 +234,21 @@ CREATE TABLE service_locations (
 -- the assessment session that informed them. Ongoing-service authorizations
 -- (97153/97155/97156) DO reference a treatment plan, because they require
 -- one to exist.
+--
+-- CHANGES IN V3:
+--   - units_requested separated from units_authorized. The BCBA asks for a
+--     specific number; the payer accepts or counters with a different one.
+--     The gap between the two is operational data — approval rates by payer
+--     become a real practice-level analytic.
+--   - units_authorized is now NULLABLE — pending auths don't have a
+--     decision yet, so leaving it NULL is more honest than putting the
+--     requested number in there as a placeholder.
+--   - submitted_at and decision_at capture the lifecycle timestamps.
+--     Cycle-time visualizations ("how long is Anthem taking this month?")
+--     become trivial queries.
 -- ----------------------------------------------------------------------------
 
--- AUTHORIZATIONS COME FIRST in v3 because sessions FK to them, and treatment
+-- AUTHORIZATIONS COME FIRST in v2 because sessions FK to them, and treatment
 -- plans FK to sessions. The dependency direction matters for table creation.
 CREATE TABLE authorizations (
     id              SERIAL PRIMARY KEY,
@@ -204,17 +259,37 @@ CREATE TABLE authorizations (
     -- treatment_plan they produce. FK gets populated for ongoing-service
     -- authorizations once the plan is signed.
     treatment_plan_id INTEGER,  -- FK added after treatment_plans is created
-    units_authorized INTEGER NOT NULL,
+    -- What the BCBA asked the payer for. Always known at submission time.
+    units_requested INTEGER NOT NULL,
+    -- What the payer actually granted. NULL until decision is made; may
+    -- equal units_requested (full approval) or differ (counter-offer).
+    -- Remains NULL on denial.
+    units_authorized INTEGER,
     units_per_week_planned INTEGER NOT NULL,
     period_start    DATE NOT NULL,
     period_end      DATE NOT NULL,
     authorization_number VARCHAR(50),
+    -- When the request went out to the payer. Required — every auth row
+    -- represents at least a submission.
+    submitted_at    TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    -- When the payer responded. NULL while pending. Required for any
+    -- non-pending status (enforced by CHECK below).
+    decision_at     TIMESTAMPTZ,
+    -- Effective date the payer assigns on the approval notice — can differ
+    -- from decision_at by days or weeks depending on the payer's process.
     approved_date   DATE,
     status          authorization_status NOT NULL DEFAULT 'pending',
     notes           TEXT,
     CHECK (period_end > period_start),
-    CHECK (units_authorized > 0),
+    CHECK (units_requested > 0),
+    CHECK (units_authorized IS NULL OR units_authorized > 0),
     CHECK (units_per_week_planned > 0),
+    -- A decision can't precede the submission that produced it.
+    CHECK (decision_at IS NULL OR decision_at >= submitted_at),
+    -- Anything past 'pending' has been decided; decision_at must be set.
+    CHECK (status = 'pending' OR decision_at IS NOT NULL),
+    -- An approved auth must carry a unit count. Denials leave it NULL.
+    CHECK (status != 'approved' OR units_authorized IS NOT NULL),
 
     -- EXCLUSION CONSTRAINT: no two APPROVED authorizations for the same
     -- client + CPT code can have overlapping date ranges. This is enforced
@@ -229,6 +304,14 @@ CREATE TABLE authorizations (
 );
 
 
+-- CHANGES IN V3:
+--   - signed_by_guardian_at and guardian_name capture the parent signature
+--     step between BCBA-signs and payer-submission. The CHECK at the
+--     bottom of the table makes the database refuse to mark a plan as
+--     submitted-to-payer without a guardian signature on file. This is
+--     the operational gate that prevents Alexandre from accidentally
+--     sending unsigned plans to insurance, regardless of what the
+--     application code says.
 CREATE TABLE treatment_plans (
     id              SERIAL PRIMARY KEY,
     client_id       INTEGER NOT NULL REFERENCES clients(id),
@@ -241,12 +324,18 @@ CREATE TABLE treatment_plans (
     clinical_narrative TEXT,
     signed_by_bcba_id INTEGER REFERENCES staff(id),
     signed_at       TIMESTAMPTZ,
+    -- Parent/guardian countersigns after the BCBA writes the plan. Payer
+    -- submission can't happen without this signature (CHECK below).
+    signed_by_guardian_at TIMESTAMPTZ,
+    guardian_name   VARCHAR(100),
     submitted_to_payer_id INTEGER REFERENCES payers(id),
     submitted_at    TIMESTAMPTZ,
     locked_at       TIMESTAMPTZ,
     generated_pdf_path TEXT,
     notes           TEXT,
-    CHECK (period_end > period_start)
+    CHECK (period_end > period_start),
+    -- Plan cannot be submitted to payer without a guardian signature.
+    CHECK (submitted_at IS NULL OR signed_by_guardian_at IS NOT NULL)
 );
 
 -- Now we can add the FK from authorizations to treatment_plans
@@ -498,6 +587,19 @@ CREATE INDEX idx_target_data_target_session
 CREATE INDEX idx_auth_client_period
     ON authorizations (client_id, period_start, period_end);
 
+-- New for v3: pending authorization queue ("what's still waiting on a
+-- decision?"). Partial index on the pending subset keeps it small.
+CREATE INDEX idx_authorizations_pending
+    ON authorizations (submitted_at)
+    WHERE status = 'pending';
+
+-- New for v3: document expiration tracking. Partial index — most documents
+-- won't have expirations (diagnostic reports, referrals), so we only index
+-- the ones that do.
+CREATE INDEX idx_client_documents_expiration
+    ON client_documents (expiration_date)
+    WHERE expiration_date IS NOT NULL;
+
 -- Indexes for Foreign Keys to prevent sequential scans during table joins
 CREATE INDEX idx_sessions_authorization ON sessions (authorization_id);
 CREATE INDEX idx_targets_program ON targets (program_id);
@@ -505,6 +607,8 @@ CREATE INDEX idx_claims_authorization ON claims (authorization_id);
 CREATE INDEX idx_claims_session ON claims (session_id);
 CREATE INDEX idx_authorizations_treatment_plan ON authorizations (treatment_plan_id);
 CREATE INDEX idx_clients_supervising_bcba ON clients (supervising_bcba_id);
+CREATE INDEX idx_client_documents_client ON client_documents (client_id);
+CREATE INDEX idx_client_documents_uploader ON client_documents (uploaded_by_id);
 
 -- ============================================================================
 -- END OF SCHEMA v3
